@@ -1,6 +1,5 @@
 # damp_t_app.py
 # Streamlit app for DAmP-T: Degradation-Aware multi-modal Physically-constrained Translation
-# Author: (Your name / org)
 # License: For research and evaluation only. Validate before production use.
 
 import io
@@ -17,6 +16,16 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="DAmP-T: Degradation-Aware IV Correction", layout="wide")
 st.title("DAmP-T — Degradation-Aware multi-modal Physically-constrained Translation")
 st.caption("Upload Light I-V, Dark I-V, and optional Suns-Voc CSVs. Get corrected 'as-is' and 'neutralized' curves at target conditions.")
+
+# ---------------------------
+# (Optional) Multi-objective solver import
+# ---------------------------
+HAS_MO = False
+try:
+    from damp_t.optim_mo import damp_t_pipeline_mo, MOWeights
+    HAS_MO = True
+except Exception:
+    HAS_MO = False  # The app will still run with the fast initializer
 
 # ---------------------------
 # Utility: CSV loaders
@@ -335,6 +344,35 @@ f_suns  = st.sidebar.file_uploader("Suns-Voc CSV (optional: G,T,Voc)", type=["cs
 target_G = st.sidebar.number_input("Target irradiance G2 [W/m^2]", 200.0, 1400.0, 1000.0, 10.0)
 target_T = st.sidebar.number_input("Target temperature T2 [°C]", -20.0, 100.0, 25.0, 0.5)
 
+# Fit mode
+fit_mode = st.sidebar.radio(
+    "Fit mode",
+    ["Fast initializer", "Precision Fit (MO)"],
+    index=0,
+    help="Use the fast single-pass initializer or the robust multi-objective solver (Light + Dark + Suns-Voc, with priors)."
+)
+if fit_mode == "Precision Fit (MO)" and not HAS_MO:
+    st.sidebar.warning("Multi-objective add-on not found. Falling back to Fast initializer. "
+                       "Drop 'damp_t/optim_mo.py' into your project or use damp_t_mo_addon.zip.")
+    fit_mode = "Fast initializer"
+
+# MO hyperparameters (show only when selected and available)
+mo_kwargs = {}
+if fit_mode == "Precision Fit (MO)" and HAS_MO:
+    st.sidebar.subheader("MO weights & robust deltas")
+    w_light = st.sidebar.slider("w_light (Light I-V)", 0.1, 3.0, 1.0, 0.1)
+    w_dark  = st.sidebar.slider("w_dark  (Dark I-V)", 0.0, 3.0, 0.6, 0.1)
+    w_suns  = st.sidebar.slider("w_suns  (Suns-Voc)", 0.0, 3.0, 0.5, 0.1)
+    dL = st.sidebar.slider("delta_light (A)", 0.05, 2.0, 0.5, 0.05)
+    dD = st.sidebar.slider("delta_dark (A)", 0.02, 1.0, 0.2, 0.02)
+    dS = st.sidebar.slider("delta_suns (V)", 0.02, 0.2, 0.08, 0.01)
+    lam = st.sidebar.slider("lambda_prior", 0.0, 0.5, 0.05, 0.01)
+    mo_kwargs["weights"] = MOWeights(
+        w_light=w_light, w_dark=w_dark, w_suns=w_suns,
+        delta_light=dL, delta_dark=dD, delta_suns=dS,
+        lambda_prior=lam
+    )
+
 run = st.sidebar.button("Run DAmP-T", type="primary")
 
 # ---------------------------
@@ -353,21 +391,80 @@ if run:
         st.error(f"CSV error: {e}")
         st.stop()
 
+    # 1) Fast initializer (always run, also provides anchor split & diagnostics)
     try:
-        res = damp_t_pipeline(df_light, df_dark, df_suns, target_G, target_T)
+        base = damp_t_pipeline(df_light, df_dark, df_suns, target_G, target_T)
     except Exception as e:
         st.exception(e)
         st.stop()
 
-    st.success("Translation complete.")
-    fig = plot_results(res["anchor"], res["translated"], res["neutralized"], title="DAmP-T Translation to Target Conditions")
+    # 2) Optionally refine with MO
+    using_mo = (fit_mode == "Precision Fit (MO)") and HAS_MO
+    objective_info = None
+    if using_mo:
+        try:
+            # Anchor light sweep (first)
+            sweeps = split_light_curves(df_light)
+            anchor = sweeps[0]
+            # Prepare arrays for MO
+            light_arr = {
+                "V": anchor["V"].values,
+                "I": anchor["I"].values,
+                "G": anchor["G"].values,
+                "T": anchor["T"].values
+            }
+            dark_arr = {
+                "V": df_dark["V"].values,
+                "I": df_dark["I"].values
+            }
+            # Suns-Voc arrays (if missing, synthesize a tiny grid using anchor Voc estimate)
+            if df_suns is not None:
+                suns_arr = {"G": df_suns["G"].values, "T": df_suns["T"].values, "Voc": df_suns["Voc"].values}
+            else:
+                # Estimate Voc from anchor (closest |I| to 0)
+                idx0 = int(np.argmin(np.abs(anchor["I"].values)))
+                Voc_est = float(anchor["V"].values[idx0])
+                Gm, Tm = float(anchor["G"].median()), float(anchor["T"].median())
+                Gs = np.array([Gm, 0.9*Gm, 0.8*Gm], dtype=float)
+                Ts = np.full_like(Gs, Tm, dtype=float)
+                Voc = np.full_like(Gs, Voc_est, dtype=float)
+                suns_arr = {"G": Gs, "T": Ts, "Voc": Voc}
+
+            # Call MO pipeline
+            res_mo = damp_t_pipeline_mo(
+                light=light_arr, dark=dark_arr, suns=suns_arr,
+                target_G=target_G, target_T=target_T,
+                **mo_kwargs
+            )
+            # Convert to DataFrames
+            translated = pd.DataFrame(res_mo["translated"])
+            neutralized = pd.DataFrame(res_mo["neutralized"])
+            # Diagnostics
+            objective_info = res_mo["objective_info"]
+            subs_opt = [sp.__dict__ for sp in res_mo["subs_opt"]]
+        except Exception as e:
+            st.warning("MO refinement failed; showing fast initializer results instead.")
+            st.exception(e)
+            using_mo = False
+
+    # Choose what to display
+    anchor_df = base["anchor"]
+    if using_mo:
+        tr_df = translated
+        neu_df = neutralized
+    else:
+        tr_df = base["translated"]
+        neu_df = base["neutralized"]
+
+    st.success("Translation complete." + (" (MO refined)" if using_mo else ""))
+    fig = plot_results(anchor_df, tr_df, neu_df, title="DAmP-T Translation to Target Conditions")
     st.pyplot(fig)
 
     # KPIs
     c1, c2, c3 = st.columns(3)
-    k_meas = kpi(res["anchor"])
-    k_tr   = kpi(res["translated"])
-    k_neu  = kpi(res["neutralized"])
+    k_meas = kpi(anchor_df)
+    k_tr   = kpi(tr_df)
+    k_neu  = kpi(neu_df)
 
     with c1:
         st.subheader("Measured (anchor)")
@@ -375,23 +472,26 @@ if run:
         st.caption(f"Vmp: {k_meas['Vmp']:.2f} V  |  Imp: {k_meas['Imp']:.2f} A")
 
     with c2:
-        st.subheader("Translated (as-is)")
+        st.subheader("Translated (as-is" + (" · MO" if using_mo else "") + ")")
         st.metric("Pmax [W]", f"{k_tr['Pmax']:.2f}")
         st.caption(f"Vmp: {k_tr['Vmp']:.2f} V  |  Imp: {k_tr['Imp']:.2f} A")
 
     with c3:
-        st.subheader("Neutralized")
+        st.subheader("Neutralized" + (" · MO" if using_mo else ""))
         st.metric("Pmax [W]", f"{k_neu['Pmax']:.2f}")
         st.caption(f"Vmp: {k_neu['Vmp']:.2f} V  |  Imp: {k_neu['Imp']:.2f} A")
 
     st.divider()
     st.subheader("Diagnostics & Parameters")
-    st.json({
-        "kinks_detected": res["kinks_detected"],
-        "Rs_estimate": res["Rs_estimate"],
-        "shunt_powerlaw": res["shunt_powerlaw"],
-        "suns_voc_fit": res["suns_voc_fit"]
-    })
+    diag = {
+        "kinks_detected": base["kinks_detected"],
+        "Rs_estimate": base["Rs_estimate"],
+        "shunt_powerlaw": base["shunt_powerlaw"],
+        "suns_voc_fit": base["suns_voc_fit"]
+    }
+    if objective_info is not None:
+        diag["objective_info"] = objective_info
+    st.json(diag)
 
     # Downloads
     def csv_button(label, df, fname):
@@ -401,23 +501,26 @@ if run:
     st.subheader("Download corrected data")
     colA, colB = st.columns(2)
     with colA:
-        csv_button("Download Translated (as-is) CSV", res["translated"], "translated_as_is.csv")
+        csv_button("Download Translated (as-is) CSV", tr_df, "translated_as_is.csv")
     with colB:
-        csv_button("Download Neutralized CSV", res["neutralized"], "translated_neutralized.csv")
+        csv_button("Download Neutralized CSV", neu_df, "translated_neutralized.csv")
 
     # Bundle everything
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("anchor_measured.csv", res["anchor"].to_csv(index=False))
-        z.writestr("translated_as_is.csv", res["translated"].to_csv(index=False))
-        z.writestr("translated_neutralized.csv", res["neutralized"].to_csv(index=False))
-        z.writestr("damp_t_params.json", json.dumps({
-            "kinks_detected": res["kinks_detected"],
-            "Rs_estimate": res["Rs_estimate"],
-            "shunt_powerlaw": res["shunt_powerlaw"],
-            "suns_voc_fit": res["suns_voc_fit"],
-            "subs": res["subs"]
-        }, indent=2))
+        z.writestr("anchor_measured.csv", anchor_df.to_csv(index=False))
+        z.writestr("translated_as_is.csv", tr_df.to_csv(index=False))
+        z.writestr("translated_neutralized.csv", neu_df.to_csv(index=False))
+        params = {
+            "kinks_detected": base["kinks_detected"],
+            "Rs_estimate": base["Rs_estimate"],
+            "shunt_powerlaw": base["shunt_powerlaw"],
+            "suns_voc_fit": base["suns_voc_fit"],
+            "subs": (subs_opt if objective_info is not None else base["subs"])
+        }
+        if objective_info is not None:
+            params["objective_info"] = objective_info
+        z.writestr("damp_t_params.json", json.dumps(params, indent=2))
     st.download_button("Download all (ZIP)", data=buf.getvalue(), file_name="damp_t_results_bundle.zip", mime="application/zip")
 
 # ---------------------------
@@ -426,16 +529,16 @@ if run:
 with st.expander("CSV schemas and tips"):
     st.markdown("""
 **Light I-V CSV:** `V, I, G, T`  
-- Voltage [V], Current [A], Irradiance G [W/m^2], Module temperature T [°C].  
+- Voltage [V], Current [A], Irradiance G [W/m²], Module temperature T [°C].  
 - You can concatenate multiple sweeps; the app will split them by voltage wrap.
 
 **Dark I-V CSV:** `V, I`  
 - Forward/reverse dark sweep is fine; low-voltage region is used to fit the non-ohmic shunt power law.
 
 **Suns-Voc CSV (optional):** `G, T, Voc`  
-- If missing, the app uses a coarse default envelope.
+- If missing, the app synthesizes a small grid for MO, but uploading real Suns-Voc is recommended.
   
 **Outputs:**  
 - **Translated (as-is):** keeps bypass, non-ohmic shunt, and degradation state.  
-- **Neutralized:** bypass=off, inactive area=0, and shunt suppressed to a high-Rsh limit, useful for "what-if" comparisons.
+- **Neutralized:** bypass=off, inactive area=0, and shunt suppressed to a high-Rsh limit (for “what-if”).
 """)
